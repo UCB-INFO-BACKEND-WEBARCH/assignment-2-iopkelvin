@@ -1,0 +1,4 @@
+flask==3.0.0
+flask-sqlalchemy
+redis==5.0.1
+rq==1.15.1
