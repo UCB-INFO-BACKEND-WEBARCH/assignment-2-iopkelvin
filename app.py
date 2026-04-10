@@ -171,10 +171,55 @@ def delete_task(id):
     return jsonify({"message": "Task deleted"}), 200
 
 
+@app.route('/api/categories', methods=['GET'])
+def get_categories():
+    return jsonify([c.to_dict() for c in CategoryModel.query.all()])
 
-@app.route('/api/categories/<int:task_id>', methods=["GET"])
-def get_tasks():
-    query = TaskModel.query
+
+@app.route('/api/categories/<int:id>', methods=['GET'])
+def get_category(id):
+    cat = db.get_or_404(CategoryModel, id)
+    return jsonify({
+        "id": cat.id,
+        "name": cat.name,
+        "color": cat.color,
+        "tasks": [
+            {"id": t.id, "title": t.title, "completed": t.completed}
+            for t in cat.tasks
+        ]
+    })
+
+
+@app.route('/api/categories', methods=['POST'])
+def create_category():
+    data = request.get_json()
+    error = validate_category(data)
+    if error:
+        return jsonify(error), 400
+    category = CategoryModel(
+        name=data["name"],
+        color=data.get("color")
+    )
+    db.session.add(category)
+    db.session.commit()
+    return jsonify(category.to_dict()), 201
+
+
+@app.route('/api/categories/<int:id>', methods=['DELETE'])
+def delete_category(id):
+    cat = db.get_or_404(CategoryModel, id)
+
+    if len(cat.tasks) > 0:
+        return jsonify({"error": "Cannot delete category with existing tasks"}), 400
+
+    db.session.delete(cat)
+    db.session.commit()
+
+    return jsonify({"message": "Category deleted"}), 200
+
+
+with app.app_context():
+    db.create_all()
 
 if __name__ == '__main__':
     app.run(debug=True)
