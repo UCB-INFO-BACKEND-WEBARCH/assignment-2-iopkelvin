@@ -9,7 +9,10 @@ import time
 
 app = Flask(__name__)
 
-app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///task_manager.db'
+app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv(
+    "DATABASE_URL",
+    "sqlite:///task_manager.db"
+)
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 db = SQLAlchemy(app)
 
@@ -105,7 +108,7 @@ def get_tasks():
         query = query.filter_by(completed=False)
 
     tasks = query.all()
-    return jsonify([t.to_dict() for t in tasks]), 200
+    return jsonify({"tasks": [t.to_dict() for t in tasks]}), 200
 
 
 @app.route('/tasks/<int:id>', methods=['GET'])
@@ -120,7 +123,7 @@ def create_task():
     data = request.get_json()
     error = validate_task(data)
     if error:
-        return jsonify(error), 400
+        return jsonify({"errors": error}), 400
 
     due_date = None
     if data.get("due_date"):
@@ -187,7 +190,7 @@ def delete_task(id):
 
 @app.route('/categories', methods=['GET'])
 def get_categories():
-    return jsonify([c.to_dict() for c in CategoryModel.query.all()])
+    return jsonify({"categories": [c.to_dict() for c in CategoryModel.query.all()]}), 200
 
 
 @app.route('/categories/<int:id>', methods=['GET'])
@@ -209,7 +212,7 @@ def create_category():
     data = request.get_json()
     error = validate_category(data)
     if error:
-        return jsonify(error), 400
+        return jsonify({"errors": error}), 400
     category = CategoryModel(
         name=data["name"],
         color=data.get("color")
