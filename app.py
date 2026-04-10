@@ -17,7 +17,7 @@ db = SQLAlchemy(app)
 migrate = Migrate(app, db)
 
 # Redis Queue
-redis_conn = Redis(host=os.getenv("REDIS_HOST", "localhost"), port=6379)
+redis_conn = Redis(host="redis", port=6379)
 q = Queue(connection=redis_conn)
 
 
@@ -121,8 +121,11 @@ def create_task():
             return jsonify({"errors": {"category_id": ["Invalid category_id"]}}), 400
 
     due_date = data.get("due_date")
-    if due_date and due_date.tzinfo is None:
-        due_date = due_date.replace(tzinfo=timezone.utc)
+    if due_date:
+        if due_date.tzinfo is None:
+            due_date = due_date.replace(tzinfo=timezone.utc)
+        else:
+            due_date = due_date.astimezone(timezone.utc)
 
     task = TaskModel(
         title=data["title"],
@@ -138,8 +141,9 @@ def create_task():
     if due_date:
         try:
             now = datetime.now(timezone.utc)
-            if now < due_date <= now + timedelta(hours=24):
-                q.enqueue(send_notification, task.title)
+            time_diff = (due_date - now).total_seconds()
+            if 0 < time_diff <= 86400:
+                q.enqueue("app.send_notification", task.title)
                 notification_queued = True
         except Exception:
             notification_queued = False
@@ -168,8 +172,11 @@ def update_task(id):
 
     if "due_date" in data:
         due_date = data.get("due_date")
-        if due_date and due_date.tzinfo is None:
-            data["due_date"] = due_date.replace(tzinfo=timezone.utc)
+        if due_date:
+            if due_date.tzinfo is None:
+                data["due_date"] = due_date.replace(tzinfo=timezone.utc)
+            else:
+                data["due_date"] = due_date.astimezone(timezone.utc)
 
     for key, value in data.items():
         setattr(task, key, value)
@@ -255,8 +262,13 @@ def internal_error(e):
     return jsonify({"error": "Internal server error"}), 500
 
 
-with app.app_context():
-    db.create_all()
+# with app.app_context():
+    # db.create_all()
+
+# Need to run these instead
+# docker compose exec app flask db init
+# docker compose exec app flask db migrate -m "init"
+# docker compose exec app flask db upgrade
 
 if __name__ == '__main__':
     app.run(host="0.0.0.0", port=5000, debug=False)
