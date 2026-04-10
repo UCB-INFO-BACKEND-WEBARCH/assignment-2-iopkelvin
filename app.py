@@ -1,20 +1,20 @@
 import os
 from flask import Flask, request, jsonify
 from flask_sqlalchemy import SQLAlchemy
-# from marshmallow import Schema, fields, validates, ValidationError
+from marshmallow import Schema, fields, validate, ValidationError
 from datetime import datetime, timezone, timedelta
 from redis import Redis
 from rq import Queue
 import time
+from flask_migrate import Migrate
+
 
 app = Flask(__name__)
 
-app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv(
-    "DATABASE_URL",
-    "sqlite:///task_manager.db"
-)
+app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv("DATABASE_URL")
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 db = SQLAlchemy(app)
+migrate = Migrate(app, db)
 
 # Redis Queue
 redis_conn = Redis(host=os.getenv("REDIS_HOST", "localhost"), port=6379)
@@ -61,36 +61,23 @@ class CategoryModel(db.Model):
         }
 
 # Validation
-def validate_task(data):
-    errors = {}
-    title = data.get("title")
-    if not title:
-        return {"error": "Title is required"}
-    if not title or len(title) > 100:
-        errors["title"] = ["Length must be between 1 and 100."]
-    description = data.get("description")
-    if description and len(description) > 500:
-        errors["description"] = ["Max 500 characters"]
-    if "category_id" in data and data["category_id"]:
-        if not db.session.get(CategoryModel, data["category_id"]):
-            errors["category_id"] = ["Invalid category_id"]
-    return errors if errors else None
+class TaskSchema(Schema):
+    title = fields.Str(required=True, validate=validate.Length(min=1, max=100))
+    description = fields.Str(allow_none=True, validate=validate.Length(max=500))
+    due_date = fields.DateTime(allow_none=True)
+    category_id = fields.Int(allow_none=True)
+    completed = fields.Bool(load_default=False)
 
-def validate_category(data):
-    if not data or "name" not in data:
-        return {"error": "Name is required"}
-    if len(data["name"]) > 50:
-        return {"error": "Name too long"}
-    if CategoryModel.query.filter_by(name=data["name"]).first():
-        return {"error": "Category already exists"}
-    if "color" in data and data["color"]:
-        color = data["color"]
-        if not isinstance(color, str) or len(color) != 7 or color[0] != "#":
-            return {"error": "Invalid hex color"}
-        hex_part = color[1:]
-        if not all(c in "0123456789abcdefABCDEF" for c in hex_part):
-            return {"error": "Invalid hex color"}
-    return None
+
+class CategorySchema(Schema):
+    name = fields.Str(required=True, validate=validate.Length(min=1, max=50))
+    color = fields.Str(
+        allow_none=True,
+        validate=validate.Regexp(r'^#[0-9a-fA-F]{6}$')
+    )
+
+task_schema = TaskSchema()
+category_schema = CategorySchema()
 
 
 def send_notification(title):
@@ -121,18 +108,22 @@ def get_task(id):
 @app.route('/tasks', methods=['POST'])
 def create_task():
     data = request.get_json()
-    error = validate_task(data)
-    if error:
-        return jsonify({"errors": error}), 400
+    if not data:
+        return jsonify({"errors": {"json": ["Invalid or missing JSON"]}}), 400
 
-    due_date = None
-    if data.get("due_date"):
-        try:
-            due_date = datetime.fromisoformat(data["due_date"])
-            if due_date.tzinfo is None:
-                due_date = due_date.replace(tzinfo=timezone.utc)
-        except:
-            return jsonify({"error": "Invalid ISO format"}), 400
+    try:
+        data = task_schema.load(data) 
+    except ValidationError as err:
+        return jsonify({"errors": err.messages}), 400
+    
+    if data.get("category_id"):
+        if not db.session.get(CategoryModel, data["category_id"]):
+            return jsonify({"errors": {"category_id": ["Invalid category_id"]}}), 400
+
+    due_date = data.get("due_date")
+    if due_date and due_date.tzinfo is None:
+        due_date = due_date.replace(tzinfo=timezone.utc)
+
     task = TaskModel(
         title=data["title"],
         description=data.get("description"),
@@ -159,22 +150,26 @@ def create_task():
 def update_task(id):
     task = db.get_or_404(TaskModel, id)
     data = request.get_json()
+    if not data:
+        return jsonify({"errors": {"json": ["Invalid or missing JSON"]}}), 400
 
-    for field in ["title", "description", "completed", "category_id"]:
-        if field in data:
-            setattr(task, field, data[field])
+    try:
+        data = task_schema.load(data, partial=True)
+    except ValidationError as err:
+        return jsonify({"errors": err.messages}), 400
+    
+    if "category_id" in data:
+        if data["category_id"] and not db.session.get(CategoryModel, data["category_id"]):
+            return jsonify({"errors": {"category_id": ["Invalid category_id"]}}), 400
 
     if "due_date" in data:
-        if data["due_date"]:
-            try:
-                dt = datetime.fromisoformat(data["due_date"])
-                if dt.tzinfo is None:
-                    dt = dt.replace(tzinfo=timezone.utc)
-                task.due_date = dt
-            except:
-                return jsonify({"error": "Invalid ISO format"}), 400
-        else:
-            task.due_date = None
+        due_date = data.get("due_date")
+        if due_date and due_date.tzinfo is None:
+            data["due_date"] = due_date.replace(tzinfo=timezone.utc)
+
+    for key, value in data.items():
+        setattr(task, key, value)
+
     db.session.commit()
 
     return jsonify(task.to_dict()), 200
@@ -210,9 +205,19 @@ def get_category(id):
 @app.route('/categories', methods=['POST'])
 def create_category():
     data = request.get_json()
-    error = validate_category(data)
-    if error:
-        return jsonify({"errors": error}), 400
+    if not data:
+        return jsonify({"errors": {"json": ["Invalid or missing JSON"]}}), 400
+
+    try:
+        data = category_schema.load(data)
+    except ValidationError as err:
+        return jsonify({"errors": err.messages}), 400
+
+    # uniqueness check (business logic)
+    if CategoryModel.query.filter_by(name=data["name"]).first():
+        return jsonify({
+            "errors": {"name": ["Category with this name already exists."]}
+        }), 400
     category = CategoryModel(
         name=data["name"],
         color=data.get("color")
@@ -227,7 +232,9 @@ def delete_category(id):
     cat = db.get_or_404(CategoryModel, id)
 
     if len(cat.tasks) > 0:
-        return jsonify({"error": "Cannot delete category with existing tasks"}), 400
+        return jsonify({
+    "error": "Cannot delete category with existing tasks. Move or delete tasks first."
+    }), 400
 
     db.session.delete(cat)
     db.session.commit()
@@ -235,9 +242,17 @@ def delete_category(id):
     return jsonify({"message": "Category deleted"}), 200
 
 
+@app.errorhandler(404)
+def not_found(e):
+    return jsonify({"error": "Not found"}), 404
+
+@app.errorhandler(500)
+def internal_error(e):
+    return jsonify({"error": "Internal server error"}), 500
+
+
 with app.app_context():
     db.create_all()
 
 if __name__ == '__main__':
-    # app.run(debug=True)
     app.run(host="0.0.0.0", port=5000, debug=False)
