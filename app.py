@@ -2,10 +2,10 @@ import os
 from flask import Flask, request, jsonify
 from flask_sqlalchemy import SQLAlchemy
 # from marshmallow import Schema, fields, validates, ValidationError
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from redis import Redis
 from rq import Queue
-
+import time
 
 app = Flask(__name__)
 
@@ -26,8 +26,9 @@ class TaskModel(db.Model):
     completed = db.Column(db.Boolean, default = False)
     due_date = db.Column(db.DateTime) # ISO
     category_id = db.Column(db.Integer, db.ForeignKey('categories.id'))
-    created_at = db.Column(db.Datetime, default=datetime.datetime)
-    updated_at = db.Column(db.Datetime, default=datetime.datetime, onupdate=datetime.datetime),
+    created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
+    updated_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc),
+                           onupdate=lambda: datetime.now(timezone.utc)),
     def to_dict(self):
         return {
             "id": self.id,
@@ -59,95 +60,116 @@ class CategoryModel(db.Model):
 # Validation
 def validate_task(data):
     errors = {}
-
     title = data.get("title")
+    if not title:
+        return {"error": "Title is required"}
     if not title or len(title) > 100:
         errors["title"] = ["Length must be between 1 and 100."]
-
     description = data.get("description")
     if description and len(description) > 500:
         errors["description"] = ["Max 500 characters"]
-
-    if "due_date" in data:
-        try:
-            datetime.fromisoformat(data["due_date"])
-        except:
-            errors["due_date"] = ["Invalid ISO format"]
-
-    if "category_id" in data and data["category_id"] is not None:
+    if "category_id" in data and data["category_id"]:
         if not db.session.get(CategoryModel, data["category_id"]):
-            errors["category_id"] = ["Invalid category_id"]
-    return errors
+            errors["error"] = ["Invalid category_id"]
+    return None
+
 
 def validate_category(data):
-    errors = {}
-
-    name = data.get("name")
-    if not name or len(name) > 50:
-        errors["name"] = ["Invalid name"]
-
-
-    if name and CategoryModel.query.filter_by(name=name).first():
-        errors["name"] = ["Category with this name already exists."]
-
-    # color = data.get("color")
-    # if color and not re.match(r'^#[0-9A-Fa-f]{6}$', color):
-        # errors["color"] = ["Invalid hex color"]
-    return errors
+    if not data or "name" not in data:
+        return {"error": "Name is required"}
+    if len(data["name"]) > 50:
+        return {"error": "Name too long"}
+    if CategoryModel.query.filter_by(name=data["name"]).first():
+        return {"error": "Category already exists"}
+    return None
 
 
+def send_notification(title):
+    time.sleep(5)
+    print(f"Reminder: Task '{title}' is due soon!")
 
 # Routes
 @app.route("/tasks", methods=["GET"])
 def get_tasks():
-    completed = request.args.get("completed")
     query = TaskModel.query
+    completed = request.args.get('completed')
+    if completed == "true":
+        query = query.filter_by(completed=True)
+    elif completed == "false":
+        query = query.filter_by(completed=False)
 
-    if completed is not None:
-        query = query.filter_by(completed=(completed.lower() == "true"))
-    
     tasks = query.all()
-    result = []
-    for task in tasks:
-        result.append({
-            "id": task.id,
-            "title": task.title,
-            "description": task.description,
-            "completed": task.completed,
-            "due_date": task.due_date.isoformat() if task.due_date else None,
-            "category_id": task.category_id,
-            "category": {
-                "id": task.category.id,
-                "name": task.category.name,
-                "color": task.category.color
-            } if task.category else None,
-            "created_at": task.created_at.isoformat(),
-            "updated_at": task.updated_at.isoformat()
-        })
-    return {"tasks": result}, 200
+    return jsonify([t.to_dict() for t in tasks]), 200
 
-@app.route('/tasks/<int:id>', methods=["GET"])
+
+@app.route('/tasks/<int:id>', methods=['GET'])
 def get_task(id):
-    task = db.session.get(TaskModel, id)
+    task = db.get_or_404(TaskModel, id)
+    return jsonify(task.to_dict()), 200
 
-    if not task:
-        return {"error": "Task not found"}, 404
 
-    return {
-        "id": task.id,
-        "title": task.title,
-        "description": task.description,
-        "completed": task.completed,
-        "due_date": task.due_date.isoformat() if task.due_date else None,
-        "category_id": task.category_id,
-        "category": {
-            "id": task.category.id,
-            "name": task.category.name,
-            "color": task.category.color
-        } if task.category else None,
-        "created_at": task.created_at.isoformat(),
-        "updated_at": task.updated_at.isoformat()
-    }, 200
+
+@app.route('/api/tasks', methods=['POST'])
+def create_task():
+    data = request.get_json()
+    error = validate_task(data)
+    if error:
+        return jsonify(error), 400
+
+    due_date = None
+    if data.get("due_date"):
+        due_date = datetime.fromisoformat(data["due_date"])
+    task = TaskModel(
+        title=data["title"],
+        description=data.get("description"),
+        due_date=due_date,
+        category_id=data.get("category_id")
+    )
+    db.session.add(task)
+    db.session.commit()
+
+    notification_queued = False
+    if due_date:
+        now = datetime.now(timezone.utc)
+        if now < due_date <= now + timedelta(hours=24):
+            q.enqueue(send_notification, task.title)
+            notification_queued = True
+
+    return jsonify({
+        "task": task.to_dict(),
+        "notification_queued": notification_queued
+    }), 201
+
+
+@app.route('/api/tasks/<int:id>', methods=['PUT'])
+def update_task(id):
+    task = db.get_or_404(TaskModel, id)
+    data = request.get_json()
+
+    for field in ["title", "description", "completed", "category_id"]:
+        if field in data:
+            setattr(task, field, data[field])
+
+    if "due_date" in data:
+        if data["due_date"]:
+            dt = datetime.fromisoformat(data["due_date"])
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            task.due_date = dt
+        else:
+            task.due_date = None
+    db.session.commit()
+
+    return jsonify(task.to_dict()), 200
+
+
+@app.route('/api/tasks/<int:id>', methods=['DELETE'])
+def delete_task(id):
+    task = db.get_or_404(TaskModel, id)
+    db.session.delete(task)
+    db.session.commit()
+    return jsonify({"message": "Task deleted"}), 200
+
 
 
 @app.route('/api/categories/<int:task_id>', methods=["GET"])
