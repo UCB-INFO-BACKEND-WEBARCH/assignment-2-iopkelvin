@@ -134,11 +134,15 @@ def create_task():
     db.session.commit()
 
     notification_queued = False
+
     if due_date:
-        now = datetime.now(timezone.utc)
-        if now < due_date <= now + timedelta(hours=24):
-            q.enqueue(send_notification, task.title)
-            notification_queued = True
+        try:
+            now = datetime.now(timezone.utc)
+            if now < due_date <= now + timedelta(hours=24):
+                q.enqueue(send_notification, task.title)
+                notification_queued = True
+        except Exception:
+            notification_queued = False
 
     return jsonify({
         "task": task.to_dict(),
