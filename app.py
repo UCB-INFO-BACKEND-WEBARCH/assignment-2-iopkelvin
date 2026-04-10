@@ -9,8 +9,8 @@ import time
 
 app = Flask(__name__)
 
-app.config['SQLAlCHEMY_DATABASE_URI'] = 'sqlite://task_manager.db'
-app.config['SQLAlCHEMY_TRACK_MODIFICATIONS'] = False
+app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///task_manager.db'
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 db = SQLAlchemy(app)
 
 # Redis Queue
@@ -28,7 +28,7 @@ class TaskModel(db.Model):
     category_id = db.Column(db.Integer, db.ForeignKey('categories.id'))
     created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
     updated_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc),
-                           onupdate=lambda: datetime.now(timezone.utc)),
+                           onupdate=lambda: datetime.now(timezone.utc))
     def to_dict(self):
         return {
             "id": self.id,
@@ -46,7 +46,7 @@ class TaskModel(db.Model):
 class CategoryModel(db.Model):
     __tablename__ = "categories"
     id = db.Column(db.Integer, primary_key=True)
-    name = db.Column(db.String(50), required = True) # unique
+    name = db.Column(db.String(50), nullable=False, unique=True) # unique
     color = db.Column(db.String(7)) # Hex
     tasks = db.relationship("TaskModel", backref="category")
     def to_dict(self):
@@ -70,9 +70,8 @@ def validate_task(data):
         errors["description"] = ["Max 500 characters"]
     if "category_id" in data and data["category_id"]:
         if not db.session.get(CategoryModel, data["category_id"]):
-            errors["error"] = ["Invalid category_id"]
-    return None
-
+            errors["category_id"] = ["Invalid category_id"]
+    return errors if errors else None
 
 def validate_category(data):
     if not data or "name" not in data:
@@ -81,6 +80,13 @@ def validate_category(data):
         return {"error": "Name too long"}
     if CategoryModel.query.filter_by(name=data["name"]).first():
         return {"error": "Category already exists"}
+    if "color" in data and data["color"]:
+        color = data["color"]
+        if not isinstance(color, str) or len(color) != 7 or color[0] != "#":
+            return {"error": "Invalid hex color"}
+        hex_part = color[1:]
+        if not all(c in "0123456789abcdefABCDEF" for c in hex_part):
+            return {"error": "Invalid hex color"}
     return None
 
 
@@ -109,7 +115,7 @@ def get_task(id):
 
 
 
-@app.route('/api/tasks', methods=['POST'])
+@app.route('/tasks', methods=['POST'])
 def create_task():
     data = request.get_json()
     error = validate_task(data)
@@ -118,7 +124,12 @@ def create_task():
 
     due_date = None
     if data.get("due_date"):
-        due_date = datetime.fromisoformat(data["due_date"])
+        try:
+            due_date = datetime.fromisoformat(data["due_date"])
+            if due_date.tzinfo is None:
+                due_date = due_date.replace(tzinfo=timezone.utc)
+        except:
+            return jsonify({"error": "Invalid ISO format"}), 400
     task = TaskModel(
         title=data["title"],
         description=data.get("description"),
@@ -141,7 +152,7 @@ def create_task():
     }), 201
 
 
-@app.route('/api/tasks/<int:id>', methods=['PUT'])
+@app.route('/tasks/<int:id>', methods=['PUT'])
 def update_task(id):
     task = db.get_or_404(TaskModel, id)
     data = request.get_json()
@@ -152,10 +163,13 @@ def update_task(id):
 
     if "due_date" in data:
         if data["due_date"]:
-            dt = datetime.fromisoformat(data["due_date"])
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-            task.due_date = dt
+            try:
+                dt = datetime.fromisoformat(data["due_date"])
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                task.due_date = dt
+            except:
+                return jsonify({"error": "Invalid ISO format"}), 400
         else:
             task.due_date = None
     db.session.commit()
@@ -163,7 +177,7 @@ def update_task(id):
     return jsonify(task.to_dict()), 200
 
 
-@app.route('/api/tasks/<int:id>', methods=['DELETE'])
+@app.route('/tasks/<int:id>', methods=['DELETE'])
 def delete_task(id):
     task = db.get_or_404(TaskModel, id)
     db.session.delete(task)
@@ -171,12 +185,12 @@ def delete_task(id):
     return jsonify({"message": "Task deleted"}), 200
 
 
-@app.route('/api/categories', methods=['GET'])
+@app.route('/categories', methods=['GET'])
 def get_categories():
     return jsonify([c.to_dict() for c in CategoryModel.query.all()])
 
 
-@app.route('/api/categories/<int:id>', methods=['GET'])
+@app.route('/categories/<int:id>', methods=['GET'])
 def get_category(id):
     cat = db.get_or_404(CategoryModel, id)
     return jsonify({
@@ -190,7 +204,7 @@ def get_category(id):
     })
 
 
-@app.route('/api/categories', methods=['POST'])
+@app.route('/categories', methods=['POST'])
 def create_category():
     data = request.get_json()
     error = validate_category(data)
@@ -205,7 +219,7 @@ def create_category():
     return jsonify(category.to_dict()), 201
 
 
-@app.route('/api/categories/<int:id>', methods=['DELETE'])
+@app.route('/categories/<int:id>', methods=['DELETE'])
 def delete_category(id):
     cat = db.get_or_404(CategoryModel, id)
 
